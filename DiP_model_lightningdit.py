@@ -884,7 +884,7 @@ def test_patch_detailer_head():
 
 
 def test_dip():
-    model = DiP(patch_detail_type="sta1ndard_mlp")
+    model = DiP(patch_detail_type="standard_mlp")
     print(f"Total Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
     # x
