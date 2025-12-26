@@ -12,11 +12,7 @@ from einops import rearrange, repeat
 
 from timm.models.vision_transformer import Mlp
 
-
-# =============================================================================
-# Inlined Dependencies
-# =============================================================================
-
+# code based on lightningdit
 # -----------------------------------------------------------------------------
 # RMSNorm (from models/rmsnorm.py)
 # -----------------------------------------------------------------------------
@@ -61,7 +57,6 @@ class SwiGLUFFN(nn.Module):
         self.w12 = nn.Linear(in_features, 2 * hidden_features, bias=bias)
         self.w3 = nn.Linear(hidden_features, out_features, bias=bias)
 
-    @torch.compile
     def forward(self, x: Tensor) -> Tensor:
         x12 = self.w12(x)
         x1, x2 = x12.chunk(2, dim=-1)
@@ -153,26 +148,12 @@ class VisionRotaryEmbeddingFast(nn.Module):
 # =============================================================================
 
 
-@torch.compile
 def modulate(
     x: torch.Tensor, shift: Optional[torch.Tensor], scale: torch.Tensor
 ) -> torch.Tensor:
     """Apply AdaLN modulation: x * (1 + scale) + shift"""
     if shift is None:
         return x * (1 + scale)
-    return x * (1 + scale) + shift
-
-
-@torch.compile
-def pixel_modulate(
-    x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
-) -> torch.Tensor:
-    """Apply pixel-wise AdaLN modulation.
-    Args:
-        x: (B*L, p^2, D_pix) pixel tokens
-        shift: (B*L, p^2, D_pix) per-pixel shift
-        scale: (B*L, p^2, D_pix) per-pixel scale
-    """
     return x * (1 + scale) + shift
 
 
@@ -533,27 +514,58 @@ class UpBlock(nn.Module):
         # 3. Convolution
         return self.conv(x)
 
+
 class PatchDetailerHeadMlp(nn.Module):
     def __init__(
         self,
         in_features: int,
+        hidden_size: int,
         patch_size: int,
         in_channels: int,
         drop: float = 0.0,
     ):
         super().__init__()
         out_features = in_channels * patch_size * patch_size
-        self.fc1 = nn.Linear(in_features, in_features * 4)
+        self.fc1 = nn.Linear(in_features + hidden_size, in_features * 4)
         self.act = nn.SiLU()
         self.fc2 = nn.Linear(in_features * 4, out_features)
         self.drop = nn.Dropout(drop)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([x, condition], dim=-1)
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
         return x
+
+
+class FinalLayer(nn.Module):
+    """
+    The final layer of LightningDiT.
+    """
+
+    def __init__(self, hidden_size, patch_size, out_channels, use_rmsnorm=True):
+        super().__init__()
+        if not use_rmsnorm:
+            self.norm_final = nn.LayerNorm(
+                hidden_size, elementwise_affine=False, eps=1e-6
+            )
+        else:
+            self.norm_final = RMSNorm(hidden_size)
+        self.linear = nn.Linear(
+            hidden_size, patch_size * patch_size * out_channels, bias=True
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
 
 class DiP(nn.Module):
     def __init__(
@@ -638,13 +650,19 @@ class DiP(nn.Module):
             )
         elif self.patch_detail_type == "standard_mlp":
             self.patch_detailer_head = PatchDetailerHeadMlp(
-                in_features=hidden_size,
+                in_features=in_channels * patch_size**2,
+                hidden_size=hidden_size,
                 patch_size=patch_size,
                 in_channels=in_channels,
                 drop=0,
             )
         else:
-            self.patch_detailer_head = nn.Linear(hidden_size, in_channels * patch_size * patch_size)
+            self.patch_detailer_head = FinalLayer(
+                hidden_size=hidden_size,
+                patch_size=patch_size,
+                out_channels=in_channels,
+                use_rmsnorm=use_rmsnorm,
+            )
 
         # Initialize weights
         self.initialize_weights()
@@ -766,15 +784,31 @@ class DiP(nn.Module):
         if self.patch_detail_type == "unet":
             s_cond = s + t_emb.unsqueeze(1)  # (B, L, D)
             s_cond = s_cond.reshape(-1, self.hidden_size)
-
             unet_input = self.patchify_pixels(x)
             unet_output = self.patch_detailer_head(unet_input, s_cond)
-            output = self.unpatchify_pixels(unet_output, H, W)
+            x = self.unpatchify_pixels(unet_output, H, W)
+        elif self.patch_detail_type == "standard_mlp":
+            x = rearrange(x, "b c (h p1) (w p2) -> b (h w) (c p1 p2)", p1=p, p2=p)
+            x = self.patch_detailer_head(x, s)  # B L D -> B L P²C
+            x = rearrange(
+                x,
+                "b (h w) (c p1 p2) -> b c (h p1) (w p2)",
+                h=H // p,
+                w=W // p,
+                p1=p,
+                p2=p,
+            )
         else:
-            output = self.patch_detailer_head(s) # B L D -> B L P²C
-            output = rearrange(output, "b l (p1 p2) c -> b c (h p1) (w p2)", h=H//p, w=W//p, p1=p, p2=p)
-
-        return output
+            x = self.patch_detailer_head(s, c.unsqueeze(1))  # B L D -> B L P²C
+            x = rearrange(
+                x,
+                "b (h w) (c p1 p2) -> b c (h p1) (w p2)",
+                h=H // p,
+                w=W // p,
+                p1=p,
+                p2=p,
+            )
+        return x
 
     def forward_with_cfg(
         self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor, cfg_scale: float
@@ -850,7 +884,7 @@ def test_patch_detailer_head():
 
 
 def test_dip():
-    model = DiP()
+    model = DiP(patch_detail_type="sta1ndard_mlp")
     print(f"Total Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
     # x
